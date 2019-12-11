@@ -1,71 +1,126 @@
-import keras
-from keras.models import load_model
-
-from agent.agent import Agent
-from functions import *
+import os
 import sys
-import matplotlib.pyplot as plt
-import seaborn as sns
+import click
+import logging
+import coloredlogs
 
-try:
-	if len(sys.argv) != 3:
-		print ("Usage: python evaluate.py [stock] [model]")
-		exit()
+import numpy as np
+import keras.backend as K
 
-	stock_name, model_name = sys.argv[1], sys.argv[2]
-	
-	model = load_model(model_name)
-	window_size = model.layers[0].input.shape.as_list()[1]
-	agent = Agent(window_size, True, model_name)
-	
-	data = getStockDataVec(stock_name)
-		
+from tqdm import tqdm
+from time import clock
 
-	l = len(data) - 1
-	batch_size = 32
-	states_sell = []
-	states_buy = []
+from agent import Agent
+from utils import get_state, get_stock_data, format_currency, format_position
 
-	state = getState(data, 0, window_size + 1)
-	total_profit = 0
-	agent.inventory = []
 
-	for t in range(l):
-		action = agent.act(state)
-		# sit
-		next_state = getState(data, t + 1, window_size + 1)
-		reward = 0
+@click.command()
+@click.option(
+    '-es',
+    '--eval-stock',
+    type=click.Path(exists=True),
+    default='data/GOOGL_2018.csv',
+    help='Evaluation stock data csv file path'
+)
+@click.option(
+    '-ws',
+    '--window-size',
+    default=10,
+    help='n-day window size of previous states to normalize over'
+)
+@click.option(
+    '-mn',
+    '--model-name',
+    default='model_GOOGL',
+    help='Name of the model for saving/checkpointing etc. [script looks in `models/`]'
+)
+@click.option(
+    '-d',
+    '--debug',
+    is_flag=True,
+    help='Flag for debug mode (prints position on each step)'
+)
+def main(eval_stock, window_size, model_name, debug):
+    """ Evaluates the stock trading bot.
+Please see https://arxiv.org/abs/1312.5602 for more details.
+Args: optional arguments [python evaluate.py --help]
+"""
+    switch_k_backend_device()
+    data = get_stock_data(eval_stock)
+    initial_offset = data[1] - data[0]
 
-		if action == 1: # buy
-			agent.inventory.append(data[t])
-			print ("Buy: " + formatPrice(data[t]))
-			states_buy.append(t)
+    if model_name is not None:
+        '''Single Model Evaluation'''
+        agent = Agent(window_size, pretrained=True, model_name=model_name)
+        profit, _ = evaluate_model(agent, data, window_size, debug)
+        show_eval_result(model_name, profit, initial_offset)
+        del agent
+    else:
+        '''Multiple Model Evaluation'''
+        for model in os.listdir('models'):
+            if not os.path.isdir('models/{}'.format(model)):
+                agent = Agent(window_size, pretrained=True, model_name=model)
+                profit = evaluate_model(agent, data, window_size, debug)
+                show_eval_result(model, profit, initial_offset)
+                del agent
 
-		elif action == 2 and len(agent.inventory) > 0: # sell
-			bought_price = agent.inventory.pop(0)
-			reward = max(data[t] - bought_price, 0)
-			total_profit += data[t] - bought_price
-			print ("Sell: " + formatPrice(data[t]) + " | Profit: " + formatPrice(data[t] - bought_price))
-			states_sell.append(t)
-			
-		done = True if t == l - 1 else False
-		agent.memory.append((state, action, reward, next_state, done))
-		state = next_state
 
-		if done:
-			print ("--------------------------------")
-			print (stock_name + " Total Profit: " + formatPrice(total_profit))
-			print ("--------------------------------")
-			#figure = "models/model_ep{}_profit:{}.png".format(str(e),round(total_profit,0))
-			plt.figure(figsize = (20, 10))
-			plt.plot(data, label = 'BTC/USDT', c = 'black')
-			plt.plot(data, 'o', label = 'predict buy', markevery = states_buy, c = 'g')
-			plt.plot(data, 'o', label = 'predict sell', markevery = states_sell, c = 'r')
-			plt.legend()
-			plt.show()
-		
-		if len(agent.memory) > batch_size:
-				agent.expReplay(batch_size) 
-	
-finally:
-	exit()
+def evaluate_model(agent, data, window_size, debug):
+    data_length = len(data) - 1
+    state = get_state(data, 0, window_size + 1)
+    total_profit = 0
+    agent.inventory = []
+    history = []
+    for t in range(data_length):
+        action = agent.act(state, is_eval=True)
+        # SIT
+        next_state = get_state(data, t + 1, window_size + 1)
+        reward = 0
+        # BUY
+        if action == 1:
+            agent.inventory.append(data[t])
+            history.append((data[t], 'BUY'))
+            if debug:
+                logging.debug('Buy at: {}'.format(format_currency(data[t])))
+        # SELL
+        elif action == 2 and len(agent.inventory) > 0:
+            history.append((data[t], 'SELL'))
+            bought_price = agent.inventory.pop(0)
+            reward = max(data[t] - bought_price, 0)
+            total_profit += data[t] - bought_price
+            if debug:
+                logging.debug('Sell at: {} | Position: {}'.format(
+                    format_currency(data[t]), format_position(data[t] - bought_price)))
+        else:
+            history.append((data[t], 'HOLD'))
+
+        done = True if t == data_length - 1 else False
+        agent.memory.append((state, action, reward, next_state, done))
+        state = next_state
+
+        if done:
+            return total_profit, history
+
+
+def show_eval_result(model_name, profit, initial_offset):
+    if profit == initial_offset or profit == 0.0:
+        logging.info('{}: USELESS\n'.format(model_name))
+    else:
+        logging.info('{}: {}\n'.format(model_name, format_position(profit)))
+
+
+def switch_k_backend_device():
+    """ Switches `keras` backend from GPU to CPU if required.
+    Faster computation on CPU (if using tensorflow-gpu).
+    """
+    if K.backend() == 'tensorflow':
+        logging.debug('switching to TensorFlow for CPU')
+        os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
+
+if __name__ == '__main__':
+    coloredlogs.install(level='DEBUG')
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('Aborted')
