@@ -8,6 +8,7 @@ def formatPrice(n):
 # returns the vector containing stock data from a fixed file
 def getStockDataVec(key):
 	vec = []
+	print("data/" + key +"/"+key+ ".csv")
 	lines = open("data/" + key +"/"+key+ ".csv", "r").read().splitlines()
 
 	for line in lines[1:]:

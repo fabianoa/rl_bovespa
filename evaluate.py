@@ -13,11 +13,14 @@ try:
 		exit()
 
 	stock_name, model_name = sys.argv[1], sys.argv[2]
-	model = load_model("models/" + model_name)
+	
+	model = load_model(model_name)
 	window_size = model.layers[0].input.shape.as_list()[1]
-
 	agent = Agent(window_size, True, model_name)
+	
 	data = getStockDataVec(stock_name)
+		
+
 	l = len(data) - 1
 	batch_size = 32
 	states_sell = []
@@ -29,7 +32,6 @@ try:
 
 	for t in range(l):
 		action = agent.act(state)
-
 		# sit
 		next_state = getState(data, t + 1, window_size + 1)
 		reward = 0
